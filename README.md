@@ -22,6 +22,7 @@
 │   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
+│   ├── reduction.py     # 兼容性反例缩减（固定顺序删除属性/元素/缩短字符串，长度严格变小且重验保持方向）
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
 │   ├── redact.py        # 基于新 schema x-sensitive 标记的实例脱敏（对象/数组并行遍历 + #/... 本地 $ref + oneOf/anyOf/allOf + 递归引用终止）
@@ -36,6 +37,7 @@
 │   ├── test_refgraph.py # $ref 引用依赖诊断单元测试（引用边 / 不可达定义 / 循环 / 无效引用 / 确定性）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
+│   ├── test_reduction.py# 反例缩减引擎单元测试（固定顺序三类删除 / 方向保持 / 上限提前结束）
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_redact.py   # 实例脱敏引擎单元测试（对象/数组遍历 / $ref / oneOf/anyOf/allOf / 递归终止 / 不可解析引用）
@@ -1333,6 +1335,149 @@ curl -X POST http://localhost:8000/api/analyses/1/redact \
 - 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时同样返回
   `422`（Pydantic 校验错误）；该接口不产生任何持久化记录，重复调用
   结果完全一致。
+
+### `POST /api/analyses/{id}/counterexample-reduction` — 兼容性反例缩减
+
+接收**单份** JSON 文档与一个兼容破坏方向（`backward` / `forward`），先用
+分析记录保存的**旧、新两版 schema** 校验文档，确认它确实属于指定的单向
+破坏类别（`backward`：旧版合法、新版拒绝；`forward`：新版合法、旧版拒绝），
+然后在**保持该方向不变**的前提下，按固定顺序做删除式贪心缩减，得到更小
+的反例。接口为**纯只读**操作：缩减只作用于提交文档的深拷贝，不修改分析
+记录、旧/新 schema、报告或样本，也不写任何历史；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段              | 类型    | 必填 | 说明                                                |
+| ----------------- | ------- | ---- | --------------------------------------------------- |
+| `document`        | any     | 是   | 待缩减的**单份** JSON 文档（任意 JSON 类型）          |
+| `direction`       | string  | 是   | 需要保持的破坏方向：`backward` / `forward`            |
+| `max_validations` | int     | 否   | 候选**重验**次数上限，缺省 `200`，范围 `1..10000`      |
+
+缩减操作按**固定顺序**枚举候选，每接受一步就从上一个接受点重新枚举
+（贪心下降；对象键按字典序，数组按下标从小到大，字符串按先序位置并从
+末位字符开始删除）：
+
+1. **删除对象属性**（`delete_property`）：根节点自身属性优先，再逐层
+   深入嵌套对象；
+2. **删除数组元素**（`delete_element`）：按下标从小到大，包括嵌套在
+   对象 / 数组中的数组；
+3. **缩短字符串**（`shorten_string`）：按字符串在文档中的先序位置，
+   对每个字符串从最后一个字符开始逐个删除。
+
+每个候选只有同时满足以下两个条件才会被接受并记录一步操作：
+
+- **序列化长度严格变小**：与当前文档使用同一紧凑 JSON 序列化
+  （`json.dumps(..., sort_keys=True, separators=(",", ":"))`）比较；
+- **重验两版后仍保持指定方向**：用旧、新 schema 各重新校验一次
+  （一次"重验"），文档仍属于请求的单向破坏类别。
+
+循环直到一轮枚举中没有候选可接受（不能再缩减），或重验次数达到
+`max_validations` 上限。**达到上限时立即停止，只返回最后一次已验证
+通过的文档**，绝不返回未经验证的候选；`limit_reached: true` 标识因
+上限提前结束。
+
+```bash
+# 旧版：s 必填、非空字符串；新版：s 必填、枚举只剩 "a"
+# {"s": "bbb", ...} 旧版合法、新版拒绝 -> backward 反例
+curl -s -X POST http://localhost:8000/api/analyses/1/counterexample-reduction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document": {"s": "bbb", "noise": {"a": 1, "b": 2}, "zzz": [1, 2, 3]},
+    "direction": "backward"
+  }' | python3 -m json.tool
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "direction": "backward",
+  "original": {"s": "bbb", "noise": {"a": 1, "b": 2}, "zzz": [1, 2, 3]},
+  "reduced": {"s": "b"},
+  "steps": [
+    {"index": 0, "op": "delete_property", "pointer": "#/noise",
+     "key": "noise", "element_index": null, "position": null,
+     "char": null, "from_length": null, "to_length": null,
+     "serialized_length_before": 47, "serialized_length_after": 25,
+     "validations_used": 1},
+    {"index": 1, "op": "delete_property", "pointer": "#/zzz",
+     "key": "zzz", "element_index": null, "position": null,
+     "char": null, "from_length": null, "to_length": null,
+     "serialized_length_before": 25, "serialized_length_after": 11,
+     "validations_used": 3},
+    {"index": 2, "op": "shorten_string", "pointer": "#/s",
+     "key": null, "element_index": null, "position": 2,
+     "char": "b", "from_length": 3, "to_length": 2,
+     "serialized_length_before": 11, "serialized_length_after": 10,
+     "validations_used": 5},
+    {"index": 3, "op": "shorten_string", "pointer": "#/s",
+     "key": null, "element_index": null, "position": 1,
+     "char": "b", "from_length": 2, "to_length": 1,
+     "serialized_length_before": 10, "serialized_length_after": 9,
+     "validations_used": 7}
+  ],
+  "validation_count": 9,
+  "max_validations": 200,
+  "limit_reached": false,
+  "serialized_length_original": 47,
+  "serialized_length_reduced": 9}
+```
+
+上例第一轮枚举中，对象属性按字典序依次是 `noise`、`s`、`zzz`：
+删 `noise` 重验通过被接受（重验 1 次）；从剩余文档重新枚举后，删 `s`
+会使文档缺少旧版必填字段（方向丢失），被拒绝（重验 2 次），随后删
+`zzz` 才被接受（重验 3 次）。字符串 `"bbb"` 的缩短轨迹为：删末位 `b`
+得 `"bb"`（仍破坏，接受），再删末位 `b` 得 `"b"`（仍破坏，接受）；
+随后尝试删 `"b"` 得到 `""` 会被旧版 `minLength: 1` 拒绝（方向丢失），
+该候选被拒绝，缩减终止。**被拒绝的候选不进入 `steps`，但仍消耗重验
+次数**（故 `validation_count` 为 9 而不是 4）。对象属性删除始终先于
+数组元素与字符串缩短尝试，因此最终结果是 `{"s": "b"}`。
+
+响应字段：
+
+| 字段                              | 说明                                                            |
+| --------------------------------- | --------------------------------------------------------------- |
+| `original`                        | 提交的原始文档（不被修改；结果中为独立副本）                     |
+| `reduced`                         | 缩减后的文档；每一步都经旧、新两版重验且仍属于指定方向            |
+| `steps[]`                         | 每一步**被接受**的操作记录（按接受先后，序号从 0 连续）           |
+| `steps[].op`                      | `delete_property` / `delete_element` / `shorten_string` 三者之一 |
+| `steps[].pointer`                 | 操作目标在文档中的位置（JSON Pointer，根为 `#`）                  |
+| `steps[].key`                     | `delete_property` 时被删属性名；其他操作为 `null`                 |
+| `steps[].element_index`           | `delete_element` 时被删元素下标；其他操作为 `null`                |
+| `steps[].position` / `char`       | `shorten_string` 时被删字符的位置（从 0 开始）与该字符            |
+| `steps[].from_length`/`to_length` | `shorten_string` 时缩短前 / 后的字符串长度                        |
+| `steps[].serialized_length_before/after` | 该步前 / 后文档的紧凑 JSON 长度（`after` 严格更小）       |
+| `validation_count`                | 实际执行的候选重验次数（旧、新各校验一次算一次；入口分类校验不计） |
+| `max_validations`                 | 本次生效的重验上限                                               |
+| `limit_reached`                   | 是否因达到上限提前结束；为 `true` 时 `reduced` 也是已验证结果      |
+
+入口文档不属于指定的单向破坏类别时返回 **`422`**，响应体给出明确原因、
+请求方向以及文档对旧 / 新两版的校验结果：
+
+| `detail.reason`     | 含义                                         |
+| ------------------- | -------------------------------------------- |
+| `valid_both`        | 文档对旧、新两版均合法，不构成任何反例        |
+| `invalid_both`      | 文档被旧、新两版同时拒绝（脏数据 / 共有约束） |
+| `wrong_direction`   | 文档属于相反方向的破坏类别，附 `actual_direction` |
+
+```bash
+curl -s -X POST http://localhost:8000/api/analyses/1/counterexample-reduction \
+  -H "Content-Type: application/json" \
+  -d '{"document": {"s": "a"}, "direction": "backward"}'
+# 422
+# {"detail": {
+#   "message": "文档对旧版与新版 schema 均校验通过，不属于任何单向破坏类别",
+#   "requested_direction": "backward",
+#   "valid_against_old": true,
+#   "valid_against_new": true,
+#   "reason": "valid_both"
+# }}
+```
+
+缺少 `document` / `direction` 字段、方向不是 `backward` / `forward`、
+`max_validations` 越界（`<1` 或 `>10000`）时返回 `422`（Pydantic 校验错误）。
+该接口不产生任何持久化记录，重复调用结果完全一致。
 
 ### `POST /api/reference-diagnostics` — `$ref` 引用依赖诊断
 

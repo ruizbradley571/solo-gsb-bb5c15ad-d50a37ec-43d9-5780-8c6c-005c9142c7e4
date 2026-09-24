@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, redact, refgraph, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, redact, reduction, refgraph, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -16,6 +16,8 @@ from app.schemas import (
     AnalysisResponse,
     CompareRequest,
     CompareResponse,
+    CounterexampleReductionRequest,
+    CounterexampleReductionResponse,
     GateRequest,
     GateResponse,
     MutationCoverageRequest,
@@ -252,6 +254,48 @@ def mutation_coverage(
         if payload.max_per_rule is not None
         else None,
     )
+    return {"analysis_id": analysis_id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/counterexample-reduction",
+    response_model=CounterexampleReductionResponse,
+    tags=["analyses"],
+    summary="兼容性反例缩减：保持单向破坏方向的前提下贪心删除式缩减文档",
+    responses={
+        422: {"description": "请求体不合法，或文档不属于指定方向的单向破坏类别"},
+    },
+)
+def reduce_counterexample_document(
+    analysis_id: int, payload: CounterexampleReductionRequest,
+    db: Session = Depends(get_db),
+):
+    # 纯只读：只用已存的旧 / 新两版 schema 校验并缩减提交文档的深拷贝，
+    # 绝不修改分析记录、报告、样本或画像历史
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    try:
+        result = reduction.reduce_counterexample(
+            row.old_schema, row.new_schema, payload.document,
+            payload.direction, payload.max_validations,
+        )
+    except reduction.NonBreakingDocument as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": str(exc),
+                "requested_direction": exc.direction,
+                "valid_against_old": exc.old_valid,
+                "valid_against_new": exc.new_valid,
+                "reason": exc.reason,
+                **(
+                    {"actual_direction": exc.actual_direction}
+                    if exc.actual_direction is not None
+                    else {}
+                ),
+            },
+        )
     return {"analysis_id": analysis_id, **result}
 
 

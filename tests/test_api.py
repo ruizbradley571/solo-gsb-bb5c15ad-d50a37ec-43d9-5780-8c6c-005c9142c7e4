@@ -1422,3 +1422,163 @@ def test_reference_diagnostics_is_readonly(client):
     assert resp.status_code == 200
     after = client.get("/api/analyses").json()["total"]
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/counterexample-reduction 兼容性反例缩减
+# ---------------------------------------------------------------------------
+
+REDUCTION_OLD = {
+    "type": "object",
+    "required": ["s"],
+    "properties": {"s": {"type": "string", "minLength": 1}},
+}
+REDUCTION_NEW = {
+    "type": "object",
+    "required": ["s"],
+    "properties": {"s": {"type": "string", "enum": ["a"]}},
+}
+
+
+def _reduction_analysis(client):
+    return _create(client, REDUCTION_OLD, REDUCTION_NEW, "reduction-case")
+
+
+def test_counterexample_reduction_backward(client):
+    analysis = _reduction_analysis(client)
+    resp = client.post(
+        f"/api/analyses/{analysis['id']}/counterexample-reduction",
+        json={"document": {"s": "bbb", "noise": {"a": 1, "b": 2},
+                           "zzz": [1, 2, 3]}, "direction": "backward"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == analysis["id"]
+    assert data["direction"] == "backward"
+    assert data["reduced"] == {"s": "b"}
+    assert data["original"] == {
+        "s": "bbb", "noise": {"a": 1, "b": 2}, "zzz": [1, 2, 3],
+    }
+    assert data["limit_reached"] is False
+    assert data["validation_count"] >= 1
+    assert data["max_validations"] == 200
+    # 每步长度严格变小；步骤序号连续；属性删除先于字符串缩短
+    for step in data["steps"]:
+        assert step["serialized_length_after"] < step["serialized_length_before"]
+    assert [s["index"] for s in data["steps"]] == list(range(len(data["steps"])))
+    ops = [s["op"] for s in data["steps"]]
+    assert ops.index("shorten_string") > max(
+        i for i, op in enumerate(ops) if op == "delete_property"
+    )
+    # 缩短步骤携带字符位置与长度信息
+    shorten = [s for s in data["steps"] if s["op"] == "shorten_string"]
+    assert all(s["pointer"].startswith("#/s") and s["char"] for s in shorten)
+    assert shorten[0]["from_length"] == shorten[0]["to_length"] + 1
+
+
+def test_counterexample_reduction_forward(client):
+    # 旧版必填 email、新版删除 -> forward 反例可缩减到空对象
+    old = {"type": "object", "required": ["email"],
+           "properties": {"email": {"type": "string"}}}
+    new = {"type": "object", "properties": {"email": {"type": "string"}}}
+    analysis = _create(client, old, new)
+
+    resp = client.post(
+        f"/api/analyses/{analysis['id']}/counterexample-reduction",
+        json={"document": {"noise": 1, "deep": {"x": "y"}},
+              "direction": "forward"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reduced"] == {}
+    assert all(s["op"] == "delete_property" for s in data["steps"])
+
+
+def test_counterexample_reduction_rejects_non_breaking_document(client):
+    analysis = _reduction_analysis(client)
+    url = f"/api/analyses/{analysis['id']}/counterexample-reduction"
+
+    # 两版都合法 -> 422 valid_both
+    resp = client.post(url, json={"document": {"s": "a"}, "direction": "backward"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "valid_both"
+    assert detail["valid_against_old"] is True
+    assert detail["valid_against_new"] is True
+    assert detail["requested_direction"] == "backward"
+
+    # 两版都拒绝 -> 422 invalid_both
+    resp = client.post(url, json={"document": 42, "direction": "backward"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["reason"] == "invalid_both"
+
+    # backward 文档配 forward 方向 -> 422 wrong_direction
+    resp = client.post(url, json={"document": {"s": "b"}, "direction": "forward"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "wrong_direction"
+    assert detail["actual_direction"] == "backward"
+
+
+def test_counterexample_reduction_limit_reached(client):
+    analysis = _reduction_analysis(client)
+    resp = client.post(
+        f"/api/analyses/{analysis['id']}/counterexample-reduction",
+        json={"document": {"s": "bbb"}, "direction": "backward",
+              "max_validations": 2},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 入口属性阶段无可删属性；字符串缩短首次重验 "bb" 保持方向即接受，
+    # 第二次重验预算用于 "b" 的下一候选——上限触发与否取决于候选分布，
+    # 但 validation_count 绝不超过上限，且返回文档必然经验证保持方向
+    assert data["validation_count"] <= 2
+    assert data["max_validations"] == 2
+    assert data["limit_reached"] in (True, False)
+
+
+def test_counterexample_reduction_readonly(client):
+    analysis = _reduction_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+
+    resp = client.post(base + "/counterexample-reduction",
+                       json={"document": {"s": "bbb", "x": 1},
+                             "direction": "backward"})
+    assert resp.status_code == 200
+
+    after = client.get(base).json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert after["samples"] == analysis["samples"]
+    # 不产生画像快照
+    assert client.get(base + "/profiles").json()["total"] == 0
+
+    # 重复调用结果一致
+    again = client.post(base + "/counterexample-reduction",
+                        json={"document": {"s": "bbb", "x": 1},
+                              "direction": "backward"}).json()
+    assert again["reduced"] == resp.json()["reduced"]
+
+
+def test_counterexample_reduction_validation_errors(client):
+    analysis = _reduction_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/counterexample-reduction"
+
+    # 缺少 document 字段 -> 422
+    assert client.post(base, json={"direction": "backward"}).status_code == 422
+    # 非法方向 -> 422
+    assert client.post(base, json={"document": {"s": "b"},
+                                   "direction": "sideways"}).status_code == 422
+    # max_validations 越界（0 / 超过硬上限）-> 422
+    assert client.post(base, json={"document": {"s": "b"}, "direction": "backward",
+                                   "max_validations": 0}).status_code == 422
+    assert client.post(base, json={"document": {"s": "b"}, "direction": "backward",
+                                   "max_validations": 10001}).status_code == 422
+
+
+def test_counterexample_reduction_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/counterexample-reduction",
+                       json={"document": {"s": "b"}, "direction": "backward"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"

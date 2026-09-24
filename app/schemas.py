@@ -7,6 +7,7 @@ from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
 from app.redact import MAX_REDACT_DOCUMENTS
+from app.reduction import DEFAULT_MAX_VALIDATIONS, MAX_VALIDATIONS_LIMIT
 from app.replay import MAX_REPLAY_DOCUMENTS
 
 
@@ -649,6 +650,103 @@ class RedactResponse(BaseModel):
     results: list[RedactedDocument] = Field(
         ..., description="按提交顺序返回的逐文档脱敏结果"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/counterexample-reduction 兼容性反例缩减
+# ---------------------------------------------------------------------------
+
+
+class CounterexampleReductionRequest(BaseModel):
+    """POST /api/analyses/{id}/counterexample-reduction 请求体。"""
+
+    document: Any = Field(
+        ...,
+        description=(
+            "待缩减的单份 JSON 文档（任意 JSON 类型）；必须先属于 direction "
+            "指定的单向破坏类别（backward：旧版合法、新版拒绝；"
+            "forward：新版合法、旧版拒绝），否则返回 422"
+        ),
+    )
+    direction: Literal["backward", "forward"] = Field(
+        ..., description="需要保持的兼容破坏方向"
+    )
+    max_validations: int = Field(
+        default=DEFAULT_MAX_VALIDATIONS,
+        ge=1,
+        le=MAX_VALIDATIONS_LIMIT,
+        description=(
+            f"候选重验次数上限（每次重验含旧、新两版各一次校验，"
+            f"1..{MAX_VALIDATIONS_LIMIT}，缺省 {DEFAULT_MAX_VALIDATIONS}）；"
+            f"达到上限时只返回最后一次已验证通过的结果"
+        ),
+    )
+
+
+class ReductionStep(BaseModel):
+    """一步被接受的缩减操作。"""
+
+    index: int = Field(..., ge=0, description="步骤序号（从 0 开始，按接受先后）")
+    op: Literal["delete_property", "delete_element", "shorten_string"] = Field(
+        ..., description="操作类型：删除对象属性 / 删除数组元素 / 缩短字符串"
+    )
+    pointer: str = Field(
+        ..., description="操作目标在文档中的位置（JSON Pointer，根为 #）"
+    )
+    key: str | None = Field(
+        default=None, description='delete_property 时被删除的属性名；其他操作为 null'
+    )
+    element_index: int | None = Field(
+        default=None, ge=0, description="delete_element 时被删除元素的下标"
+    )
+    position: int | None = Field(
+        default=None, ge=0, description="shorten_string 时被删除字符在原字符串中的位置"
+    )
+    char: str | None = Field(default=None, description="shorten_string 时被删除的字符")
+    from_length: int | None = Field(
+        default=None, ge=0, description="shorten_string 时缩短前的字符串长度"
+    )
+    to_length: int | None = Field(
+        default=None, ge=0, description="shorten_string 时缩短后的字符串长度"
+    )
+    serialized_length_before: int = Field(
+        ..., ge=0, description="该步前当前文档的紧凑 JSON 序列化长度"
+    )
+    serialized_length_after: int = Field(
+        ..., ge=0, description="该步后文档的紧凑 JSON 序列化长度（严格小于前值）"
+    )
+    validations_used: int = Field(
+        ..., ge=1, description="接受该步时累计使用的重验次数"
+    )
+
+
+class CounterexampleReductionResponse(BaseModel):
+    """兼容性反例缩减结果（接口只读，不修改分析记录、不持久化）。"""
+
+    analysis_id: int
+    direction: Literal["backward", "forward"] = Field(
+        ..., description="请求指定并全程保持的兼容破坏方向"
+    )
+    original: Any = Field(..., description="提交的原始文档（未被修改）")
+    reduced: Any = Field(
+        ...,
+        description=(
+            "缩减后的文档；每一步都经旧、新两版重新校验且仍属于指定方向；"
+            "达到上限时也是最后一次已验证通过的文档"
+        ),
+    )
+    steps: list[ReductionStep] = Field(
+        ..., description="每步被接受的操作记录（按接受先后，指针可定位回原文）"
+    )
+    validation_count: int = Field(
+        ..., ge=0, description="实际执行的候选重验次数（旧、新两版各校验一次算一次）"
+    )
+    max_validations: int = Field(..., ge=1, description="本次生效的重验次数上限")
+    limit_reached: bool = Field(
+        ..., description="是否因达到重验次数上限而提前结束（True 时仅返回已验证结果）"
+    )
+    serialized_length_original: int = Field(..., ge=0, description="原文紧凑 JSON 序列化长度")
+    serialized_length_reduced: int = Field(..., ge=0, description="缩减结果紧凑 JSON 序列化长度")
 
 
 # ---------------------------------------------------------------------------
