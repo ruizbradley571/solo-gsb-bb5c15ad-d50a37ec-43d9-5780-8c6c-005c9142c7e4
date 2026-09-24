@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, redact, refgraph, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, redact, refgraph, replay, sarif, shrink
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -16,6 +16,8 @@ from app.schemas import (
     AnalysisResponse,
     CompareRequest,
     CompareResponse,
+    CounterexampleReductionRequest,
+    CounterexampleReductionResponse,
     GateRequest,
     GateResponse,
     MutationCoverageRequest,
@@ -287,6 +289,40 @@ def redact_analysis_documents(
         )
     return {"analysis_id": analysis_id,
             "total_documents": len(payload.documents), **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/counterexample-reduction",
+    response_model=CounterexampleReductionResponse,
+    tags=["analyses"],
+    summary="兼容性反例缩减：保持单向破坏方向贪心最小化单篇文档",
+    responses={
+        422: {"description": "文档不属于指定的单向破坏类别（两版均合法 / 两版均拒绝 / 方向相反）"},
+    },
+)
+def reduce_counterexample(
+    analysis_id: int, payload: CounterexampleReductionRequest,
+    db: Session = Depends(get_db),
+):
+    # 纯只读：只用已存的旧/新 schema 校验与缩减提交文档的深拷贝，
+    # 绝不修改原文、分析记录或库中样本
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    try:
+        result = shrink.shrink_counterexample(
+            row.old_schema, row.new_schema, payload.document, payload.direction
+        )
+    except shrink.NotDirectionalCounterexample as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": exc.message,
+                "requested_direction": exc.direction,
+                "classification": exc.classification,
+            },
+        )
+    return {"analysis_id": analysis_id, **result}
 
 
 @app.get(

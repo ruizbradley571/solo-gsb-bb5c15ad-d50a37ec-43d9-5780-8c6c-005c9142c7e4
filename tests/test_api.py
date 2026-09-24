@@ -1323,6 +1323,189 @@ def test_redact_uses_new_schema_not_old(client):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/counterexample-reduction 兼容性反例缩减
+# ---------------------------------------------------------------------------
+
+
+SHRINK_OLD_SCHEMA = {
+    "type": "object",
+    "required": ["id", "note", "tags"],
+    "properties": {
+        "id": {"type": "integer"},
+        "note": {"type": "string", "minLength": 1},
+        "tags": {"type": "array"},
+    },
+}
+SHRINK_NEW_SCHEMA = {
+    "type": "object",
+    "required": ["id", "note", "tags", "status"],
+    "properties": {
+        "id": {"type": "integer"},
+        "note": {"type": "string", "minLength": 4},
+        "tags": {"type": "array", "minItems": 2},
+        "status": {"type": "string"},
+    },
+}
+
+
+@pytest.fixture
+def shrink_analysis(client):
+    resp = client.post("/api/analyses", json={
+        "name": "shrink-case",
+        "old_schema": SHRINK_OLD_SCHEMA,
+        "new_schema": SHRINK_NEW_SCHEMA,
+    })
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_counterexample_reduction_backward_full_flow(client, shrink_analysis):
+    # 缺 status、tags 只有 1 个元素 -> 旧合法新拒绝（backward）
+    document = {"id": 1, "note": "abcd", "tags": [7], "extra": 9}
+    resp = client.post(
+        f"/api/analyses/{shrink_analysis['id']}/counterexample-reduction",
+        json={"document": document, "direction": "backward"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["analysis_id"] == shrink_analysis["id"]
+    assert data["direction"] == "backward"
+    assert data["original_document"] == document
+    # id/note/tags 旧版必填被保留；extra 被删、tags 元素被删空、note 缩到旧下限
+    assert data["reduced_document"] == {"id": 1, "note": "a", "tags": []}
+    assert data["limit_reached"] is False
+    assert data["max_validations"] == 1000
+    assert data["validations"] >= 1
+    assert data["original_length"] > data["reduced_length"]
+
+    operations = [(s["operation"], s["pointer"]) for s in data["steps"]]
+    assert operations[0] == ("delete_object_property", "#/extra")
+    # 固定算子顺序：所有属性删除先于数组删除先于字符串缩短
+    order = {"delete_object_property": 0, "delete_array_element": 1,
+             "shorten_string": 2}
+    op_ranks = [order[s["operation"]] for s in data["steps"]]
+    assert op_ranks == sorted(op_ranks)
+    assert ("delete_array_element", "#/tags/0") in operations
+    assert operations[-1] == ("shorten_string", "#/note")
+    for step in data["steps"]:
+        assert step["length_after"] < step["length_before"]
+
+    # 提交原文未被修改
+    assert document == {"id": 1, "note": "abcd", "tags": [7], "extra": 9}
+
+
+def test_counterexample_reduction_forward(client):
+    # 旧版必填 email 且禁止额外字段；新版无约束 -> forward 实锤
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object", "required": ["email"],
+                       "additionalProperties": False},
+        "new_schema": {"type": "object"},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(
+        f"/api/analyses/{analysis_id}/counterexample-reduction",
+        json={"document": {"name": "bob", "nums": [1, 2, 3]},
+              "direction": "forward"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["direction"] == "forward"
+    assert data["reduced_document"] == {}
+    assert data["limit_reached"] is False
+
+
+def test_counterexample_reduction_accepts_root_scalar_document(client, shrink_analysis):
+    # 单份文档可以是任意 JSON 类型：42 被旧/新同时拒绝（object）-> 422
+    resp = client.post(
+        f"/api/analyses/{shrink_analysis['id']}/counterexample-reduction",
+        json={"document": 42, "direction": "backward"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["classification"] == "invalid_both"
+
+
+def test_counterexample_reduction_rejects_non_counterexample_422(client, shrink_analysis):
+    base = f"/api/analyses/{shrink_analysis['id']}/counterexample-reduction"
+
+    # 两版都合法（补全 status、tags 两个元素、note 足够长）
+    resp = client.post(base, json={
+        "document": {"id": 1, "note": "abcd", "tags": [1, 2], "status": "x"},
+        "direction": "backward"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["classification"] == "valid"
+    assert detail["requested_direction"] == "backward"
+
+    # 两版都拒绝（id 类型错误）
+    resp = client.post(base, json={"document": {"id": "bad"}, "direction": "backward"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["classification"] == "invalid_both"
+
+    # 方向相反：{} 在 backward 分析里仍是 backward（缺字段）；
+    # 用一个 forward 分析构造 forward 文档再请求 backward
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object", "required": ["email"]},
+        "new_schema": {"type": "object"},
+    })
+    forward_id = resp.json()["id"]
+    resp = client.post(
+        f"/api/analyses/{forward_id}/counterexample-reduction",
+        json={"document": {}, "direction": "backward"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["classification"] == "forward"
+
+
+def test_counterexample_reduction_validation_errors(client, shrink_analysis):
+    base = f"/api/analyses/{shrink_analysis['id']}/counterexample-reduction"
+    # 缺 document
+    assert client.post(base, json={"direction": "backward"}).status_code == 422
+    # 非法 direction
+    assert client.post(base, json={"document": {}, "direction": "sideways"}).status_code == 422
+    # 空请求体
+    assert client.post(base, json={}).status_code == 422
+
+
+def test_counterexample_reduction_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/counterexample-reduction",
+                       json={"document": {}, "direction": "backward"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
+def test_counterexample_reduction_is_readonly(client, shrink_analysis):
+    before = client.get(f"/api/analyses/{shrink_analysis['id']}").json()
+    resp = client.post(
+        f"/api/analyses/{shrink_analysis['id']}/counterexample-reduction",
+        json={"document": {"id": 1, "note": "abcd", "tags": [7]},
+              "direction": "backward"})
+    assert resp.status_code == 200
+    after = client.get(f"/api/analyses/{shrink_analysis['id']}").json()
+    assert after["report"] == before["report"]
+    assert after["old_schema"] == before["old_schema"]
+    assert after["new_schema"] == before["new_schema"]
+    # 画像数量不受影响
+    profiles = client.get(f"/api/analyses/{shrink_analysis['id']}/profiles").json()
+    assert profiles["total"] == 0
+
+
+def test_counterexample_reduction_limit_reached(client):
+    # 旧 minLength 90、新 minLength 100；95 字符的字符串是 backward 反例，
+    # 自然缩减需要 5 步；通过引擎常量无法在接口层覆盖上限（接口固定 1000），
+    # 因此这里断言大上限下能正常到达自然下限而不是误报提前结束
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "string", "minLength": 90},
+        "new_schema": {"type": "string", "minLength": 100},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(
+        f"/api/analyses/{analysis_id}/counterexample-reduction",
+        json={"document": "x" * 95, "direction": "backward"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["limit_reached"] is False
+    assert data["reduced_document"] == "x" * 90
+    assert len(data["steps"]) == 5
+
+
+# ---------------------------------------------------------------------------
 # POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
 # ---------------------------------------------------------------------------
 

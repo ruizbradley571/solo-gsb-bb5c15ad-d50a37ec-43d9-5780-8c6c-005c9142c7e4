@@ -652,6 +652,67 @@ class RedactResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/counterexample-reduction 兼容性反例缩减
+# ---------------------------------------------------------------------------
+
+
+class CounterexampleReductionRequest(BaseModel):
+    """POST /api/analyses/{id}/counterexample-reduction 请求体。"""
+
+    document: Any = Field(
+        ...,
+        description=(
+            "待缩减的单篇 JSON 文档（任意 JSON 类型，非文档列表）；"
+            "必须属于 direction 指定的单向破坏类别"
+        ),
+    )
+    direction: Literal["backward", "forward"] = Field(
+        ...,
+        description=(
+            "破坏方向：backward = 旧版合法、新版拒绝；"
+            "forward = 新版合法、旧版拒绝"
+        ),
+    )
+
+
+class ReductionStep(BaseModel):
+    """一次被接受的缩减操作。"""
+
+    operation: Literal[
+        "delete_object_property",
+        "delete_array_element",
+        "shorten_string",
+    ] = Field(..., description="操作类型：删除对象属性 / 删除数组元素 / 缩短字符串")
+    pointer: str = Field(
+        ...,
+        description="被操作位置的实例 JSON Pointer（删除为被删属性/元素位置，根为 #）",
+    )
+    length_before: int = Field(..., ge=0, description="操作前文档的 JSON 序列化长度")
+    length_after: int = Field(..., ge=0, description="操作后文档的 JSON 序列化长度（严格变小）")
+
+
+class CounterexampleReductionResponse(BaseModel):
+    """反例缩减结果（接口只读，不持久化、不改动分析记录与入参原文）。"""
+
+    analysis_id: int
+    direction: Literal["backward", "forward"]
+    original_document: Any = Field(..., description="提交的原始文档（原样回显）")
+    reduced_document: Any = Field(..., description="缩减后的文档（保持指定破坏方向且经验证）")
+    original_length: int = Field(..., ge=0, description="原始文档的紧凑 JSON 序列化长度")
+    reduced_length: int = Field(..., ge=0, description="缩减后文档的紧凑 JSON 序列化长度")
+    steps: list[ReductionStep] = Field(
+        ..., description="按接受先后记录的每步操作路径（固定算子顺序：对象属性 → 数组元素 → 字符串）"
+    )
+    validations: int = Field(
+        ..., ge=1, description="本次缩减实际执行的旧/新双版校验尝试次数（含初始分类，每次重验计 1）"
+    )
+    max_validations: int = Field(..., ge=1, description="双版校验尝试次数上限（达到后提前结束）")
+    limit_reached: bool = Field(
+        ..., description="是否因达到校验次数上限提前结束；为 true 时 reduced_document 仍为最后一次验证通过的结果"
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
 # ---------------------------------------------------------------------------
 

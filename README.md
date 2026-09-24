@@ -17,7 +17,7 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、x-sensitive 实例脱敏、$ref 引用依赖诊断
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、x-sensitive 实例脱敏、兼容性反例缩减、$ref 引用依赖诊断
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
@@ -25,6 +25,7 @@
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
 │   ├── redact.py        # 基于新 schema x-sensitive 标记的实例脱敏（对象/数组并行遍历 + #/... 本地 $ref + oneOf/anyOf/allOf + 递归引用终止）
+│   ├── shrink.py        # 兼容性反例缩减（单篇文档按删属性/删元素/缩字符串固定顺序贪心最小化，保持指定破坏方向，校验次数上限）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -39,6 +40,7 @@
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_redact.py   # 实例脱敏引擎单元测试（对象/数组遍历 / $ref / oneOf/anyOf/allOf / 递归终止 / 不可解析引用）
+│   ├── test_shrink.py   # 反例缩减引擎单元测试（三类算子固定顺序 / 方向保持 / 长度严格递减 / 上限提前结束 / 只读确定性）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -175,6 +177,29 @@ curl -s -X POST "http://localhost:8000/api/analyses/$RID/redact" \
   -d '{"documents": [
     {"name": "alice", "ssn": "111-22-3333", "cards": [{"number": "4111..."}]}
   ]}' | python3 -m json.tool
+```
+
+也可以一键体验**兼容性反例缩减**：提交一篇属于某个单向破坏方向的
+JSON 文档，服务会在保持该方向的前提下按"删对象属性 → 删数组元素 →
+缩短字符串"的固定顺序贪心缩减（访问地址
+`http://localhost:8000/api/analyses/<ID>/counterexample-reduction`）：
+
+```bash
+# 1) 创建分析（旧版无约束 -> 新版必填 status）
+CID=$(curl -s -X POST http://localhost:8000/api/analyses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "old_schema": {"type": "object"},
+    "new_schema": {"type": "object", "required": ["status"]}
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+# 2) 缩减一篇"旧合法、新拒绝"的反例：旁支属性被逐个删除，最终得到最小反例 {}
+curl -s -X POST "http://localhost:8000/api/analyses/$CID/counterexample-reduction" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document": {"noise": "hello", "tags": [1, 2, 3], "meta": {"k": "v"}},
+    "direction": "backward"
+  }' | python3 -m json.tool
 ```
 
 容器内测试（可选）：仓库自带的接口与引擎测试不会打进镜像；本地源码目录下
@@ -1333,6 +1358,124 @@ curl -X POST http://localhost:8000/api/analyses/1/redact \
 - 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时同样返回
   `422`（Pydantic 校验错误）；该接口不产生任何持久化记录，重复调用
   结果完全一致。
+
+### `POST /api/analyses/{id}/counterexample-reduction` — 兼容性反例缩减
+
+接收**一篇** JSON 文档（任意 JSON 类型）与破坏方向（`backward` /
+`forward`），先用分析记录保存的**旧版与新版 schema 双版校验**确认它
+确实属于指定的单向破坏类别，再贪心式地缩减文档，在**始终保持该破坏
+方向**的前提下得到更小的最小化反例：
+
+| 方向        | 文档必须满足               | 含义                 |
+| ----------- | -------------------------- | -------------------- |
+| `backward`  | 旧版合法、**新版拒绝**     | 向后不兼容的实锤反例 |
+| `forward`   | 新版合法、**旧版拒绝**     | 向前不兼容的实锤反例 |
+
+文档两版均合法（`valid`）、两版均拒绝（`invalid_both`）或属于另一方向
+时，返回 **`422`** 并在 `detail` 中给出实际分类与原因；分析编号不存在
+返回 `404`。
+
+接口为**纯只读**操作：缩减只作用于**提交文档的深拷贝**，不修改请求
+原文，也不改动分析记录、旧/新 schema、样本或画像历史。
+
+请求体：
+
+| 字段        | 类型   | 必填 | 说明                                                  |
+| ----------- | ------ | ---- | ----------------------------------------------------- |
+| `document`  | any    | 是   | **单份**待缩减 JSON 文档（对象 / 数组 / 字符串 / 数字 / `null`，不是列表） |
+| `direction` | string | 是   | `backward`（旧合法新拒绝）或 `forward`（新合法旧拒绝） |
+
+**缩减算法（确定性、无随机源）**：每轮按以下**固定顺序**枚举候选编辑，
+找到第一个可接受的候选后接受并从头开始下一轮：
+
+1. **删除对象属性**（`delete_object_property`）：DFS 先序遍历全部对象，
+   对象键按插入顺序；
+2. **删除数组元素**（`delete_array_element`）：DFS 先序遍历全部数组，
+   下标从小到大（按下标删除并整体前移）；
+3. **缩短字符串**（`shorten_string`）：DFS 先序遍历全部字符串**值**
+   （不改动对象键名），每次删除末字符一个。
+
+一个候选只有同时满足以下两条才会被接受：
+
+- 候选文档的紧凑 JSON 序列化长度（`json.dumps`）**严格变小**；
+- 用旧、新两版 schema **重新校验后仍保持指定方向**（只要求方向不变，
+  允许缩减后触发同方向上的另一条规则——例如删掉必填属性后从
+  `minItems` 失败退化为 `required` 失败，仍算保持 `backward`）。
+
+当一整轮没有任何候选可接受时停止（已最小化）；或在旧/新双版校验
+尝试次数达到上限 **1000**（初始分类 + 每次重验各计 1 次）时提前停止。
+**即使因上限提前结束，也只返回最后一次通过双版验证的文档**。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/counterexample-reduction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document": {"id": 1, "note": "hello", "tags": [7, 8], "extra": 9},
+    "direction": "backward"
+  }'
+```
+
+（对应旧 schema 必填 `id`/`note`/`tags`，新 schema 额外必填 `status`、
+要求 `note` 至少 4 个字符、`tags` 至少 2 个元素——文档缺 `status` 因此
+旧合法、新拒绝。）响应：
+
+```json
+{
+  "analysis_id": 1,
+  "direction": "backward",
+  "original_document": {"id": 1, "note": "hello", "tags": [7, 8], "extra": 9},
+  "reduced_document": {"id": 1, "note": "h", "tags": []},
+  "original_length": 46,
+  "reduced_length": 29,
+  "steps": [
+    {"operation": "delete_object_property", "pointer": "#/extra",
+     "length_before": 46, "length_after": 36},
+    {"operation": "delete_array_element", "pointer": "#/tags/0",
+     "length_before": 36, "length_after": 34},
+    {"operation": "delete_array_element", "pointer": "#/tags/0",
+     "length_before": 34, "length_after": 33},
+    {"operation": "shorten_string", "pointer": "#/note",
+     "length_before": 33, "length_after": 32},
+    {"operation": "shorten_string", "pointer": "#/note",
+     "length_before": 32, "length_after": 31},
+    {"operation": "shorten_string", "pointer": "#/note",
+     "length_before": 31, "length_after": 30},
+    {"operation": "shorten_string", "pointer": "#/note",
+     "length_before": 30, "length_after": 29}
+  ],
+  "validations": 33,
+  "max_validations": 1000,
+  "limit_reached": false
+}
+```
+
+响应字段：
+
+| 字段                | 说明                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `original_document` | 提交的原始文档（原样回显，入参本身不会被修改）                 |
+| `reduced_document`  | 缩减后的文档；始终经验证保持 `direction` 指定的破坏方向        |
+| `original_length` / `reduced_length` | 缩减前 / 后文档的紧凑 JSON 序列化长度（每步严格递减） |
+| `steps[]`           | 按接受先后记录的每步操作：`operation`、`pointer`（被删属性 / 元素位置或被缩短字符串位置，JSON Pointer，根为 `#`）、`length_before` / `length_after` |
+| `validations`       | 本次实际执行的旧/新双版校验尝试次数（含初始分类，每次重验计 1） |
+| `max_validations`   | 校验次数上限（`1000`）                                       |
+| `limit_reached`     | 是否因达到上限提前结束；为 `true` 时 `reduced_document` 仍是最后一次验证通过的结果 |
+
+文档不属于指定方向时返回 `422`：
+
+```json
+{
+  "detail": {
+    "message": "文档对旧版与新版 schema 均校验通过，不属于单向破坏反例",
+    "requested_direction": "backward",
+    "classification": "valid"
+  }
+}
+```
+
+`classification` 为 `valid`（两版均合法）/ `invalid_both`（两版均拒绝）/
+`backward` / `forward`（后两者在与请求方向相反时出现）。缺少
+`document` 字段或 `direction` 取值非法时返回 Pydantic 校验错误 `422`。
 
 ### `POST /api/reference-diagnostics` — `$ref` 引用依赖诊断
 
